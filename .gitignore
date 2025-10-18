@@ -1,3 +1,5 @@
 ignorefile.txt
 
 ignorefolder1/
+
+*.log
