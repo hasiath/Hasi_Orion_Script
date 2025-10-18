@@ -235,6 +235,10 @@ class IssueAggregator:
         grouped = defaultdict(list)
         
         for issue in issues:
+            # Skip INFO level issues
+            if issue['severity'] == 'INFO':
+                continue
+                
             # Create a key based on category and similar message content
             key = (issue['category'], self._normalize_message(issue['message']))
             grouped[key].append(issue)
@@ -250,7 +254,7 @@ class IssueAggregator:
                 'first_occurrence': issue_list[-1]['timestamp'],
                 'last_occurrence': issue_list[0]['timestamp'],
                 'severity': max((i['severity'] for i in issue_list), 
-                              key=lambda x: ['INFO', 'WARNING', 'ERROR', 'CRITICAL'].index(x)),
+                              key=lambda x: ['WARNING', 'ERROR', 'CRITICAL'].index(x)),
                 'sample_message': issue_list[0]['message'][:500],
                 'affected_files': list(set(i['file'] for i in issue_list)),
                 'exception_type': issue_list[0].get('exception_type'),
@@ -258,7 +262,7 @@ class IssueAggregator:
             })
         
         # Sort by severity and count
-        severity_order = {'CRITICAL': 0, 'ERROR': 1, 'WARNING': 2, 'INFO': 3}
+        severity_order = {'CRITICAL': 0, 'ERROR': 1, 'WARNING': 2}
         aggregated.sort(key=lambda x: (severity_order[x['severity']], -x['count']))
         
         return aggregated
@@ -275,6 +279,79 @@ class IssueAggregator:
 
 class ResolutionFinder:
     """Finds resolutions for identified issues"""
+    
+    def __init__(self):
+        self.kb_base_url = "https://support.solarwinds.com"
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+    
+    def search_solarwinds_kb(self, error_keywords: str) -> List[Dict]:
+        """Search SolarWinds KB for relevant articles"""
+        kb_articles = []
+        
+        try:
+            # Extract key terms from error message
+            search_terms = self._extract_search_terms(error_keywords)
+            
+            logging.info(f"Searching SolarWinds KB for: {search_terms}")
+            
+            # Search SolarWinds support site
+            search_url = f"{self.kb_base_url}/SuccessCenter/s/global-search/{search_terms}"
+            
+            try:
+                response = self.session.get(search_url, timeout=10)
+                if response.status_code == 200:
+                    # Extract KB article links from response
+                    kb_pattern = r'href="(/SuccessCenter/s/article/[^"]+)"[^>]*>([^<]+)</a>'
+                    matches = re.findall(kb_pattern, response.text)
+                    
+                    for url_path, title in matches[:5]:  # Top 5 results
+                        full_url = f"{self.kb_base_url}{url_path}"
+                        kb_articles.append({
+                            'title': title.strip(),
+                            'url': full_url
+                        })
+                        logging.info(f"Found KB: {title}")
+            except Exception as e:
+                logging.warning(f"Could not search KB: {e}")
+        
+        except Exception as e:
+            logging.error(f"KB search error: {e}")
+        
+        return kb_articles
+    
+    def _extract_search_terms(self, message: str) -> str:
+        """Extract meaningful search terms from error message"""
+        # Remove common words and format for search
+        message = message.lower()
+        
+        # Extract key error indicators
+        key_terms = []
+        
+        # Look for specific error codes
+        error_codes = re.findall(r'\b\d{4,5}\b', message)
+        if error_codes:
+            key_terms.extend(error_codes)
+        
+        # Extract exception types
+        exceptions = re.findall(r'(\w+Exception|\w+Error)', message)
+        if exceptions:
+            key_terms.extend(exceptions)
+        
+        # Key error terms
+        important_terms = ['timeout', 'deadlock', 'failed', 'connection', 'authentication',
+                          'permission', 'denied', 'polling', 'snmp', 'wmi', 'sql', 
+                          'service', 'license', 'certificate', 'memory', 'disk']
+        
+        for term in important_terms:
+            if term in message:
+                key_terms.append(term)
+        
+        # Create search query (max 5 terms)
+        search_query = ' '.join(key_terms[:5]) if key_terms else message[:50]
+        return search_query.replace(' ', '+')
     
     RESOLUTION_DATABASE = {
         'sql_error': {
@@ -543,16 +620,28 @@ class ResolutionFinder:
         message = issue['sample_message']
         
         resolutions = []
+        kb_articles = []
+        
+        # Search SolarWinds KB for real articles
+        logging.info(f"Searching KB for: {category}")
+        kb_articles = self.search_solarwinds_kb(message)
         
         if category in self.RESOLUTION_DATABASE:
             # Try to match specific error type
             for error_type, resolution_data in self.RESOLUTION_DATABASE[category].items():
                 if any(keyword.lower() in message.lower() for keyword in error_type.split()):
-                    resolutions.append(resolution_data)
+                    # Merge KB articles with resolution data
+                    resolution_copy = resolution_data.copy()
+                    if kb_articles:
+                        resolution_copy['kb_articles'] = kb_articles
+                    resolutions.append(resolution_copy)
             
             # If no specific match, provide generic resolution for category
             if not resolutions:
-                resolutions.append(list(self.RESOLUTION_DATABASE[category].values())[0])
+                first_resolution = list(self.RESOLUTION_DATABASE[category].values())[0].copy()
+                if kb_articles:
+                    first_resolution['kb_articles'] = kb_articles
+                resolutions.append(first_resolution)
         else:
             # Generic troubleshooting steps
             resolutions.append({
@@ -566,7 +655,7 @@ class ResolutionFinder:
                     'Check SolarWinds Support portal for similar issues',
                     'Contact SolarWinds Technical Support if issue persists'
                 ],
-                'kb_articles': ['General Troubleshooting Guide'],
+                'kb_articles': kb_articles if kb_articles else [],
                 'prevention': 'Regular system health checks'
             })
         
@@ -776,6 +865,17 @@ class ReportGenerator:
             padding: 10px;
             background: #e7f3ff;
             border-radius: 4px;
+            line-height: 1.8;
+        }
+        .kb-articles a {
+            color: #004085;
+            text-decoration: none;
+            display: block;
+            padding: 3px 0;
+        }
+        .kb-articles a:hover {
+            text-decoration: underline;
+            color: #002752;
         }
         .kb-articles strong {
             color: #004085;
@@ -930,8 +1030,16 @@ class ReportGenerator:
                 
                 if resolution.get('kb_articles'):
                     html += """                        <div class="kb-articles">
-                            <strong>📚 Knowledge Base:</strong> """ + ', '.join(resolution['kb_articles']) + """
-                        </div>
+                            <strong>📚 SolarWinds Knowledge Base Articles:</strong><br>
+"""
+                    for kb in resolution['kb_articles']:
+                        if isinstance(kb, dict):
+                            html += f"""                            <a href="{kb['url']}" target="_blank" style="color: #004085; text-decoration: none;">• {kb['title']}</a><br>
+"""
+                        else:
+                            html += f"""                            • {kb}<br>
+"""
+                    html += """                        </div>
 """
                 
                 if resolution.get('prevention'):
