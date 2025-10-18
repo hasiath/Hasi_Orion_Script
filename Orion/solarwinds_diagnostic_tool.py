@@ -7,6 +7,7 @@ import os
 import re
 import json
 import logging
+import requests
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Tuple
 from pathlib import Path
